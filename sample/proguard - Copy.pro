@@ -1,0 +1,3 @@
+-verbose
+-optimizationpasses 1
+-ignorewarnings
