@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  # Only run push on main
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  # Always run on PRs
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.job }} / JDK ${{ matrix.java }} / AGP ${{ matrix.agp }} / TraceRefs ${{ matrix.tracerefs }}
+    # Use macOS for emulator hardware acceleration
+    runs-on: macOS-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false # We want to see all results
+      matrix:
+        java: ['8', '11']
+        agp: ['4.2.1', '7.0.0-beta01']
+        tracerefs: [true, false]
+        job: ['instrumentation', 'plugin']
+        exclude:
+          # AGP 7.x requires JDK 11+
+          - agp: 7.0.0-beta01
+            java: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Gradle Wrapper Validation
+        uses: gradle/wrapper-validation-action@v1
+
+      - name: Generate cache key
+        run: ./checksum.sh checksum.txt
+
+      - uses: actions/cache@v2
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ matrix.java }}-${{ hashFiles('checksum.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-${{ matrix.java }}-
+
+      - name: Install JDK ${{ matrix.java }}
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'adopt'
+          java-version: ${{ matrix.java }}
+
+      - name: Test plugin
+        if: matrix.job == 'plugin'
+        run: ./gradlew -p keeper-gradle-plugin clean check --stacktrace -PkeeperTest.agpVersion=${{ matrix.agp }}
+
+      - name: Run instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
+        if: matrix.job == 'instrumentation'
+        with:
+          # We don't want to wait for the emulator to start/stop twice, so we combine this script into the same step.
+          script: .github/workflows/run_instrumentation_tests.sh ${{ matrix.agp }} ${{ matrix.tracerefs }}
+          api-level: 29
+
+      - name: (Fail-only) Bundle the build report
+        if: failure()
+        run: find . -type d -name 'reports' | zip -@ -r build-reports.zip
+
+      - name: (Fail-only) Upload the build report
+        if: failure()
+        uses: actions/upload-artifact@v2
+        with:
+          name: error-report
+          path: build-reports.zip
+
+      - name: Reclaim memory
+        run: ./gradlew --stop && jps|grep -E 'KotlinCompileDaemon|GradleDaemon'| awk '{print $1}'| xargs kill -9 || true
+        if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && matrix.java == '8' && matrix.agp == '4.2.1' && matrix.tracerefs && matrix.job == 'plugin'
+
+      - name: Upload snapshot (main only)
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SonatypeUsername }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SonatypePassword }}
+        run: |
+          ./publish.sh --snapshot
+        if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && matrix.java == '8' && matrix.agp == '4.2.1' && matrix.tracerefs && matrix.job == 'plugin'
